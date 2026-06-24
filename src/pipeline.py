@@ -22,12 +22,19 @@ def run_pipeline(candidates_path: str, jd_path: str, output_path: str):
     job_desc_path = Path(jd_path)
     out_path = Path(output_path)
     
-    # Fallback to vettly/ if not found directly (handles execution from workspace root vs. vettly root)
-    if not cand_path.exists() and Path("vettly").joinpath(cand_path).exists():
-        cand_path = Path("vettly").joinpath(cand_path)
-    if not job_desc_path.exists() and Path("vettly").joinpath(job_desc_path).exists():
-        job_desc_path = Path("vettly").joinpath(job_desc_path)
-        
+    # Fallback to check if file exists, if not check common folders
+    if not cand_path.exists():
+        for alt in [Path("data").joinpath(cand_path.name), Path("[PUB] India_runs_data_and_ai_challenge").joinpath("India_runs_data_and_ai_challenge").joinpath(cand_path.name)]:
+            if alt.exists():
+                cand_path = alt
+                break
+                
+    if not job_desc_path.exists():
+        for alt in [Path("data").joinpath(job_desc_path.name), Path("[PUB] India_runs_data_and_ai_challenge").joinpath("India_runs_data_and_ai_challenge").joinpath(job_desc_path.name)]:
+            if alt.exists():
+                job_desc_path = alt
+                break
+                
     print(f"Candidates Path: {cand_path.resolve()}")
     print(f"Job Description Path: {job_desc_path.resolve()}")
     print(f"Output Path: {out_path.resolve()}")
@@ -39,8 +46,13 @@ def run_pipeline(candidates_path: str, jd_path: str, output_path: str):
         raise FileNotFoundError(f"Job description file not found at: {job_desc_path}")
         
     print("Loading datasets...")
-    with open(cand_path, "r", encoding="utf-8") as f:
-        candidates = json.load(f)
+    if str(cand_path).endswith(".jsonl"):
+        with open(cand_path, "r", encoding="utf-8") as f:
+            candidates = [json.loads(line) for line in f]
+    else:
+        with open(cand_path, "r", encoding="utf-8") as f:
+            candidates = json.load(f)
+            
     with open(job_desc_path, "r", encoding="utf-8") as f:
         jd = json.load(f)
         

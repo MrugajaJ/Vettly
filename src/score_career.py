@@ -22,7 +22,7 @@ def compute_job_age(job: dict) -> float:
         return 0.0
 
 def compute_raw_keyword_score(candidate: dict, jd: dict) -> float:
-    """Compute the raw, recency-decayed keyword score for a candidate."""
+    """Compute the raw, recency-decayed keyword score for a candidate, supporting nested career_history."""
     keywords = jd.get("keywords") or []
     history = candidate.get("career_history") or candidate.get("experience") or candidate.get("work_experience") or []
     if not keywords or not history:
@@ -46,10 +46,7 @@ def compute_raw_keyword_score(candidate: dict, jd: dict) -> float:
     return float(total_score)
 
 def compute_keyword_max(candidates: list[dict], jd: dict, tfidf=None) -> float:
-    """Scans the candidate pool and returns the maximum raw keyword score.
-    
-    The tfidf parameter is included in the signature to match the requested interface.
-    """
+    """Scans the candidate pool and returns the maximum raw keyword score."""
     max_val = 0.0
     for cand in candidates:
         score = compute_raw_keyword_score(cand, jd)
@@ -59,12 +56,11 @@ def compute_keyword_max(candidates: list[dict], jd: dict, tfidf=None) -> float:
     return max(max_val, 1.0)
 
 def compute_A(candidate: dict, jd: dict, tfidf, keyword_max: float) -> dict:
-    """Computes the career fit score (A) for a candidate.
+    """Computes the career fit score (A) for a candidate, supporting nested and flat schemas."""
+    profile = candidate.get("profile") or {}
     
-    Formula: A = 0.35 * title_sim + 0.25 * industry_match + 0.25 * prod_keyword_density + 0.15 * yoe_score
-    """
     # 1. Title Similarity
-    cand_title = candidate.get("current_title", "")
+    cand_title = profile.get("current_title") or candidate.get("current_title", "")
     jd_title = jd.get("title", "")
     if not cand_title or not jd_title:
         title_sim = 0.0
@@ -77,7 +73,21 @@ def compute_A(candidate: dict, jd: dict, tfidf, keyword_max: float) -> dict:
             title_sim = 0.0
             
     # 2. Industry Match (Jaccard similarity)
-    cand_industries = {ind.strip().lower() for ind in (candidate.get("industries") or []) if ind}
+    cand_industries = set()
+    # Check profile industry
+    prof_ind = profile.get("current_industry")
+    if prof_ind:
+        cand_industries.add(prof_ind.strip().lower())
+    # Check career history industries
+    history = candidate.get("career_history") or candidate.get("experience") or candidate.get("work_experience") or []
+    for job in history:
+        if isinstance(job, dict) and job.get("industry"):
+            cand_industries.add(job["industry"].strip().lower())
+    # Fallback to top-level industries list if present
+    for ind in (candidate.get("industries") or []):
+        if ind:
+            cand_industries.add(ind.strip().lower())
+            
     jd_industries = {ind.strip().lower() for ind in (jd.get("target_industries") or []) if ind}
     if not jd_industries:
         industry_match = 0.0
@@ -91,7 +101,7 @@ def compute_A(candidate: dict, jd: dict, tfidf, keyword_max: float) -> dict:
     prod_keyword_density = min(raw_kw / keyword_max, 1.0)
     
     # 4. YoE Score
-    yoe = candidate.get("years_of_experience") or candidate.get("yoe") or 0.0
+    yoe = profile.get("years_of_experience") or profile.get("yoe") or candidate.get("years_of_experience") or candidate.get("yoe") or 0.0
     min_yoe = jd.get("min_yoe") or 5
     if min_yoe <= 0:
         yoe_score = 1.0

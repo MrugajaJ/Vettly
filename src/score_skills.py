@@ -56,7 +56,12 @@ def skill_trust(skill_obj, assess_scores: dict, jd_skill: str) -> float:
     assess_val = 0.0
     if isinstance(assess_scores, dict):
         # Try exact key lookup or fuzzy key lookup in the assessment scores
-        assess_val = assess_scores.get(jd_skill) or assess_scores.get(name) or 0.0
+        # First try exact case-insensitive match on jd_skill or name
+        assess_val = assess_scores.get(jd_skill) or assess_scores.get(name)
+        if assess_val is None:
+            # Try case-insensitive lookup
+            lower_scores = {k.lower(): v for k, v in assess_scores.items()}
+            assess_val = lower_scores.get(jd_skill.lower()) or lower_scores.get(name.lower()) or 0.0
     assess_w = float(assess_val) / 100.0
     
     # 4. Duration Weight
@@ -66,10 +71,7 @@ def skill_trust(skill_obj, assess_scores: dict, jd_skill: str) -> float:
     return float(trust)
 
 def compute_B(candidate: dict, jd: dict) -> dict:
-    """Computes the skill trust score (B) for a candidate.
-    
-    Formula: B = min(0.75 * must_cov + 0.25 * nice_cov + cert_bonus, 1.0)
-    """
+    """Computes the skill trust score (B) for a candidate, supporting nested and flat structures."""
     must_have_skills = jd.get("must_have_skills") or []
     nice_to_have_skills = jd.get("nice_to_have_skills") or []
     
@@ -77,7 +79,12 @@ def compute_B(candidate: dict, jd: dict) -> dict:
     nice_trust = {s: 0.0 for s in nice_to_have_skills}
     
     cand_skills = candidate.get("skills") or []
-    assess_scores = candidate.get("skill_assessment_scores") or {}
+    
+    # Try looking in nested redrob_signals for assessment scores first
+    signals = candidate.get("redrob_signals") or {}
+    assess_scores = signals.get("skill_assessment_scores")
+    if assess_scores is None:
+        assess_scores = candidate.get("skill_assessment_scores") or {}
     
     # Calculate trust for matching skills
     for s_obj in cand_skills:

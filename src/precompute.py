@@ -8,12 +8,11 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from tqdm import tqdm
 
 def build_candidate_text(cand: dict) -> str:
-    """Build a consolidated text string from candidate fields.
+    """Build a consolidated text string from candidate fields, supporting nested schemas."""
+    profile = cand.get("profile") or {}
     
-    Structure: current_title + headline + all skill names joined + all career titles and descriptions capped at 500 chars each.
-    """
-    current_title = cand.get("current_title") or ""
-    headline = cand.get("headline") or ""
+    current_title = profile.get("current_title") or cand.get("current_title") or ""
+    headline = profile.get("headline") or cand.get("headline") or ""
     
     # Skill names
     skills = cand.get("skills") or []
@@ -63,17 +62,23 @@ def build_jd_text(jd: dict) -> str:
     cleaned_parts = [p.strip() for p in parts if p and p.strip()]
     return " ".join(cleaned_parts)
 
-def precompute():
+def precompute(candidates_path=None, jd_path=None, precomputed_dir=None):
     # Resolve paths
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    vettly_dir = os.path.dirname(script_dir)
-    data_dir = os.path.join(vettly_dir, "data")
-    precomputed_dir = os.path.join(data_dir, "precomputed")
+    project_root = os.path.dirname(script_dir)
     
+    if not precomputed_dir:
+        precomputed_dir = os.path.join(project_root, "data", "precomputed")
     os.makedirs(precomputed_dir, exist_ok=True)
     
-    candidates_path = os.path.join(data_dir, "candidates.json")
-    jd_path = os.path.join(data_dir, "job_description.json")
+    if not candidates_path:
+        candidates_path = os.path.join(project_root, "data", "candidates.json")
+        # Try JSON Lines fallback
+        if not os.path.exists(candidates_path) and os.path.exists(candidates_path + "l"):
+            candidates_path += "l"
+            
+    if not jd_path:
+        jd_path = os.path.join(project_root, "data", "job_description.json")
     
     print(f"Loading job description from {jd_path}...")
     with open(jd_path, "r", encoding="utf-8") as f:
@@ -84,14 +89,18 @@ def precompute():
     if not os.path.exists(candidates_path):
         raise FileNotFoundError(f"Candidates file not found at {candidates_path}")
         
-    with open(candidates_path, "r", encoding="utf-8") as f:
-        candidates = json.load(f)
+    if candidates_path.endswith(".jsonl"):
+        with open(candidates_path, "r", encoding="utf-8") as f:
+            candidates = [json.loads(line) for line in f]
+    else:
+        with open(candidates_path, "r", encoding="utf-8") as f:
+            candidates = json.load(f)
         
     print(f"Processing {len(candidates)} candidates...")
     candidate_texts = []
     candidate_ids = []
     for cand in tqdm(candidates, desc="Building candidate texts"):
-        cand_id = cand.get("id") or cand.get("candidate_id") or ""
+        cand_id = cand.get("candidate_id") or cand.get("id") or ""
         candidate_ids.append(str(cand_id))
         candidate_texts.append(build_candidate_text(cand))
         

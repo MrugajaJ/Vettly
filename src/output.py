@@ -1,20 +1,25 @@
 import polars as pl
 
 def generate_reasoning(result: dict, jd: dict) -> str:
-    """Generates a structured reasoning string for a candidate's fit."""
+    """Generates a structured reasoning string for a candidate's fit, supporting nested schemas."""
     candidate = result["candidate"]
+    profile = candidate.get("profile") or {}
+    signals = candidate.get("redrob_signals") or {}
     
-    name = candidate.get("name") or candidate.get("candidate_name") or "Unknown"
-    yoe = candidate.get("years_of_experience") or candidate.get("yoe") or 0
+    name = profile.get("anonymized_name") or profile.get("name") or candidate.get("name") or "Unknown"
+    yoe = profile.get("years_of_experience") or profile.get("yoe") or candidate.get("years_of_experience") or candidate.get("yoe") or 0
     
     # Get current company/title
     history = candidate.get("career_history") or candidate.get("experience") or candidate.get("work_experience") or []
-    company = "Unknown"
-    title = candidate.get("current_title") or ""
+    company = profile.get("current_company") or "Unknown"
+    title = profile.get("current_title") or candidate.get("current_title") or ""
+    
     if history and isinstance(history, list) and isinstance(history[0], dict):
         if not title:
             title = history[0].get("title") or ""
-        company = history[0].get("company") or history[0].get("company_name") or "Unknown"
+        if company == "Unknown":
+            company = history[0].get("company") or history[0].get("company_name") or "Unknown"
+            
     if not title:
         title = "Candidate"
         
@@ -35,9 +40,9 @@ def generate_reasoning(result: dict, jd: dict) -> str:
             skill_names.append(s)
     top_skills_str = ", ".join(filter(None, skill_names)) or "None"
     
-    open_to_work = bool(candidate.get("open_to_work_flag", False))
-    notice_period_days = candidate.get("notice_period_days", 0)
-    github_activity_score = candidate.get("github_activity_score", 0)
+    open_to_work = bool(signals.get("open_to_work_flag") if signals.get("open_to_work_flag") is not None else candidate.get("open_to_work_flag", False))
+    notice_period_days = signals.get("notice_period_days") if signals.get("notice_period_days") is not None else candidate.get("notice_period_days", 0)
+    github_activity_score = signals.get("github_activity_score") if signals.get("github_activity_score") is not None else candidate.get("github_activity_score", 0)
     
     final_score = result["final_score"]
     A = result["A"]
@@ -57,6 +62,7 @@ def write_submission(results: list[dict], jd: dict, out_path: str = 'submission.
     rows = []
     for res in results:
         cand = res["candidate"]
+        signals = cand.get("redrob_signals") or {}
         reasoning = generate_reasoning(res, jd)
         
         rows.append({
@@ -66,8 +72,8 @@ def write_submission(results: list[dict], jd: dict, out_path: str = 'submission.
             "availability_mult": res["availability_mult"],
             "location_mult": res["location_mult"],
             "reasoning": reasoning,
-            "profile_completeness_score": cand.get("profile_completeness_score", 0),
-            "saved_by_recruiters_30d": cand.get("saved_by_recruiters_30d", 0),
+            "profile_completeness_score": signals.get("profile_completeness_score") or cand.get("profile_completeness_score", 0),
+            "saved_by_recruiters_30d": signals.get("saved_by_recruiters_30d") or cand.get("saved_by_recruiters_30d", 0),
             "component_scores": f"A={res['A']:.3f}, B={res['B']:.3f}, C={res['C']:.3f}"
         })
         
