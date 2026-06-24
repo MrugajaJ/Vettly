@@ -1,0 +1,32 @@
+# Virtual Environment
+vettly_env/
+env/
+venv/
+.env
+
+# Datasets and Large Files (Do not push to GitHub)
+\[PUB\]*/
+\[PUB\]*
+*India_runs_data_and_ai_challenge*
+*.jsonl
+*.npy
+*.index
+*.pkl
+*.csv
+vettly/data/
+data/
+
+# Python Cache & Testing
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
