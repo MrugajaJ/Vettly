@@ -1,0 +1,1036 @@
+
+INTELLIGENT CANDIDATE RANKING SYSTEM
+Redrob Challenge — Winning Architecture Implementation Guide
+
+
+Detailed Step-by-Step Build Order
+Formula Reference  ·  Code Blueprints  ·  Schema Field Mapping
+
+Based on Day-0 Architecture + Redrob Candidate Schema
+
+Table of Contents
+
+Section 1 ........... Overview & Architecture Summary
+Section 2 ........... Environment Setup & Dependencies
+Section 3 ........... Stage 0 — Offline Precompute
+Section 4 ........... Stage 1 — Hard Disqualify Filter
+Section 5 ........... Stage 2A — Title & Career Match Score
+Section 6 ........... Stage 2B — Skill Trust Score
+Section 7 ........... Stage 2C — Embedding Similarity
+Section 8 ........... Raw Score Assembly
+Section 9 ........... Stage 3 — Behavioral Availability Multiplier
+Section 10 ......... Stage 4 — Top-100 Sort & Reasoning Generation
+Section 11 ......... Full Pipeline Runner
+Section 12 ......... Validation, Testing & Submission
+Section 13 ......... Advanced Upgrades (Optional)
+
+Section 1 — Overview & Architecture Summary
+
+This document provides a complete, step-by-step implementation guide for the Intelligent Candidate Discovery and Ranking system. Each stage is described with its purpose, the exact schema fields it consumes, pseudocode/code blueprints, and the order of implementation to avoid dependency issues.
+
+1.1  The Five-Stage Pipeline
+
+
+
+
+
+
+1.2  Recommended Build Order (Why This Order)
+The build order is dependency-driven. Each stage depends on the previous one being correct before it is worth optimizing the next:
+
+Environment Setup — nothing works without this.
+Stage 1 (Hard Filter) first — cheapest to write, kills ~40% of candidates before any scoring runs. You get immediate runtime savings.
+Stage 2B (Skill Trust Score) second — highest signal-per-schema-field ratio. Directly uses skills[], skill_assessment_scores, endorsements.
+Stage 2C (Embedding Similarity) third — precomputed, O(1) at ranking time. Needs Stage 0 index built first.
+Stage 0 (Offline Precompute) — built before Stage 2C but run once offline. Listed here in coding order.
+Stage 2A (Title + Career) — uses TF-IDF and career[]. Moderate complexity.
+Stage 3 (Availability Multiplier) — simple additive logic on redrob_signals fields.
+Stage 4 (Sort + CSV) — wire everything together, produce output.
+Full Pipeline Runner + Validation — end-to-end test.
+
+Section 2 — Environment Setup & Dependencies
+
+2.1  Python Version & Virtual Environment
+Use Python 3.10+ (3.11 recommended for performance). Create a dedicated virtual environment to isolate dependencies.
+
+# Create virtual environment
+python3.11 -m venv ranker_env
+source ranker_env/bin/activate        # Linux/macOS
+ranker_env\Scripts\activate           # Windows
+
+# Verify
+python --version                      # Should print Python 3.11.x
+
+2.2  Package Installation
+Install all required packages. Keep a requirements.txt for reproducibility.
+
+pip install sentence-transformers==2.7.0  # all-MiniLM-L6-v2 / BGE embeddings
+pip install faiss-cpu==1.8.0              # vector similarity index
+pip install scikit-learn==1.4.2           # TF-IDF, cosine similarity
+pip install numpy==1.26.4                 # array operations
+pip install pandas==2.2.2                 # data wrangling, CSV output
+pip install rapidfuzz==3.9.3              # fuzzy skill name matching
+pip install python-dateutil==2.9.0        # date arithmetic for recency
+pip install tqdm==4.66.4                  # progress bars for 100K candidates
+pip install pytest==8.2.0                 # unit tests
+
+2.3  Project Directory Structure
+ranker/
+├── data/
+│   ├── candidates.json        # raw candidate dataset (input)
+│   ├── job_description.json   # JD input
+│   └── precomputed/
+│       ├── jd_vec.npy         # JD embedding (Stage 0 output)
+│       ├── cand_vecs.npy      # candidate embeddings (Stage 0 output)
+│       ├── cand_ids.json      # ordered list of candidate IDs
+│       ├── faiss.index        # FAISS flat index (Stage 0 output)
+│       └── tfidf.pkl          # fitted TF-IDF vectorizer (Stage 0 output)
+├── src/
+│   ├── precompute.py          # Stage 0
+│   ├── hard_filter.py         # Stage 1
+│   ├── score_career.py        # Stage 2A
+│   ├── score_skills.py        # Stage 2B
+│   ├── score_embed.py         # Stage 2C
+│   ├── raw_score.py           # assemble A+B+C
+│   ├── availability.py        # Stage 3 multiplier
+│   ├── output.py              # Stage 4 sort + CSV
+│   └── pipeline.py            # full runner
+├── tests/
+│   └── test_*.py
+├── submission.csv             # final output
+└── requirements.txt
+
+2.4  Input Format
+The system expects two JSON files:
+candidates.json — list of candidate objects, each matching the Redrob Candidate Profile Schema.
+job_description.json — a structured JD object. If only a raw text JD is provided, parse it into this shape first.
+
+# job_description.json structure (define this yourself)
+{
+  "title": "Senior Backend Engineer",
+  "min_yoe": 3,
+  "target_industries": ["Technology", "FinTech", "SaaS"],
+  "preferred_locations": ["Bangalore", "Hyderabad", "Remote"],
+  "budget_max_inr_lpa": 30,
+  "must_have_skills": ["Python", "Django", "PostgreSQL", "REST APIs"],
+  "nice_to_have_skills": ["Docker", "Kubernetes", "Redis", "AWS"],
+  "keywords": ["microservices", "scalability", "CI/CD", "agile"],
+  "description": "...full JD text..."
+}
+
+Section 3 — Stage 0: Offline Precompute
+
+
+3.1  Schema Fields Used
+
+
+3.2  Candidate Text Representation
+Each candidate is represented as a single concatenated string built from their most informative structured fields. This string is fed to the sentence transformer for embedding.
+
+
+3.3  Code Blueprint: precompute.py
+import json, pickle, numpy as np
+from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+import faiss
+from pathlib import Path
+from tqdm import tqdm
+
+MODEL_NAME = 'sentence-transformers/all-MiniLM-L6-v2'  # 384-dim, fast
+OUT_DIR    = Path('data/precomputed')
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def build_cand_text(c: dict) -> str:
+    p = c['profile']
+    skills = ' '.join(s['name'] for s in c.get('skills', []))
+    career_text = ' '.join(
+        (h['title'] + ' ' + h['description'][:500])
+        for h in c.get('career_history', [])
+    )
+    return f"{p['current_title']} {p.get('headline','')} {skills} {career_text}"
+
+def build_jd_text(jd: dict) -> str:
+    skills = ' '.join(jd['must_have_skills'] + jd.get('nice_to_have_skills', []))
+    return f"{jd['title']} {skills} {jd.get('description','')}"
+
+def run_precompute(candidates_path, jd_path):
+    candidates = json.loads(Path(candidates_path).read_text())
+    jd         = json.loads(Path(jd_path).read_text())
+
+    model = SentenceTransformer(MODEL_NAME)
+
+    # 1. Build candidate texts
+    cand_ids   = [c['candidate_id'] for c in candidates]
+    cand_texts = [build_cand_text(c) for c in tqdm(candidates, desc='Building texts')]
+
+    # 2. Embed all candidates (batch=256 for memory efficiency)
+    print('Embedding candidates ...')
+    cand_vecs = model.encode(
+        cand_texts, batch_size=256,
+        normalize_embeddings=True,   # cosine = dot product on L2-norm vecs
+        show_progress_bar=True
+    ).astype('float32')
+
+    # 3. Embed JD
+    jd_vec = model.encode([build_jd_text(jd)],
+                          normalize_embeddings=True).astype('float32')
+
+    # 4. Build FAISS index (flat = exact, no approximation)
+    index = faiss.IndexFlatIP(cand_vecs.shape[1])  # inner product = cosine
+    index.add(cand_vecs)
+
+    # 5. Fit TF-IDF on candidate corpus
+    tfidf = TfidfVectorizer(max_features=30000, ngram_range=(1,2))
+    tfidf.fit(cand_texts)
+
+    # 6. Save all artifacts
+    np.save(OUT_DIR / 'jd_vec.npy', jd_vec)
+    np.save(OUT_DIR / 'cand_vecs.npy', cand_vecs)
+    (OUT_DIR / 'cand_ids.json').write_text(json.dumps(cand_ids))
+    faiss.write_index(index, str(OUT_DIR / 'faiss.index'))
+    with open(OUT_DIR / 'tfidf.pkl', 'wb') as f: pickle.dump(tfidf, f)
+
+    print(f'Done. {len(cand_ids)} candidates indexed.')
+
+if __name__ == '__main__':
+    run_precompute('data/candidates.json', 'data/job_description.json')
+
+
+Section 4 — Stage 1: Hard Disqualify Filter
+
+
+4.1  Schema Fields Used
+
+
+4.2  Kill Rules
+
+4.3  Code Blueprint: hard_filter.py
+from datetime import datetime, timezone
+from sklearn.metrics.pairwise import cosine_similarity
+import pickle, numpy as np
+
+def load_tfidf(path='data/precomputed/tfidf.pkl'):
+    with open(path, 'rb') as f: return pickle.load(f)
+
+def is_killed(candidate: dict, jd: dict, tfidf, today=None) -> tuple[bool, str]:
+    """Returns (killed: bool, reason: str)."""
+    if today is None:
+        today = datetime.now(timezone.utc).date()
+
+    sig = candidate['redrob_signals']
+    prof = candidate['profile']
+
+    # Rule 1: ghost profile
+    if sig['profile_completeness_score'] < 30:
+        return True, 'profile_completeness < 30'
+
+    # Rule 2: unverified identity
+    if not sig['verified_email']:
+        return True, 'unverified_email'
+
+    # Rule 3: serial no-show
+    if sig['interview_completion_rate'] < 0.20:
+        return True, 'interview_completion_rate < 0.20'
+
+    # Rule 4: stale profile
+    from dateutil.parser import parse as parse_date
+    last_active = parse_date(sig['last_active_date']).date()
+    if (today - last_active).days > 180:
+        return True, 'inactive > 180 days'
+
+    # Rule 5: not open to work
+    if not sig['open_to_work_flag']:
+        return True, 'not_open_to_work'
+
+    # Rule 6: zero industry overlap
+    cand_industries = {prof.get('current_industry', '')}
+    cand_industries |= {h['industry'] for h in candidate.get('career_history', [])}
+    jd_industries = set(jd.get('target_industries', []))
+    if jd_industries and len(cand_industries & jd_industries) == 0:
+        return True, 'no_industry_overlap'
+
+    # Rule 7: title completely off-topic
+    cand_title_vec = tfidf.transform([prof['current_title']])
+    jd_title_vec   = tfidf.transform([jd['title']])
+    sim = cosine_similarity(cand_title_vec, jd_title_vec)[0, 0]
+    if sim < 0.05:
+        return True, f'title_similarity={sim:.3f}<0.05'
+
+    # Rule 8: honeypot detection
+    gh = sig.get('github_activity_score', -1)
+    no_assessment = len(sig.get('skill_assessment_scores', {})) == 0
+    no_endorse    = sig.get('endorsements_received', 0) == 0
+    no_connections= sig.get('connection_count', 0) < 5
+    if gh == -1 and no_assessment and no_endorse and no_connections:
+        return True, 'honeypot_ghost_profile'
+
+    return False, ''
+
+def apply_hard_filter(candidates, jd, tfidf):
+    """Returns (survivors, killed_ids)."""
+    survivors, killed = [], []
+    for c in candidates:
+        killed_flag, reason = is_killed(c, jd, tfidf)
+        if killed_flag:
+            killed.append({'candidate_id': c['candidate_id'], 'reason': reason})
+        else:
+            survivors.append(c)
+    print(f'Hard filter: {len(killed)} killed, {len(survivors)} survivors')
+    return survivors, killed
+
+Section 5 — Stage 2A: Title & Career Match Score (Component A)
+
+
+5.1  Schema Fields Used
+
+
+5.2  Formula Breakdown
+
+5.3  Code Blueprint: score_career.py
+import numpy as np, pickle
+from datetime import datetime, timezone
+from dateutil.parser import parse as parse_date
+from sklearn.metrics.pairwise import cosine_similarity
+import re
+
+DECAY_LAMBDA = 0.15   # half-life ~ 4.6 years
+
+def compute_A(candidate: dict, jd: dict, tfidf, keyword_max: float) -> dict:
+    prof = candidate['profile']
+    today = datetime.now(timezone.utc).date()
+
+    # ── title_sim ──────────────────────────────────────
+    cand_title_vec = tfidf.transform([prof['current_title']])
+    jd_title_vec   = tfidf.transform([jd['title']])
+    title_sim = float(cosine_similarity(cand_title_vec, jd_title_vec)[0, 0])
+
+    # ── industry_match ────────────────────────────────
+    cand_inds = {prof.get('current_industry', '')}
+    cand_inds |= {h['industry'] for h in candidate.get('career_history', [])}
+    jd_inds = set(jd.get('target_industries', []))
+    matched = len(cand_inds & jd_inds) if jd_inds else 0
+    industry_match = min(matched / max(len(jd_inds), 1), 1.0)
+
+    # ── prod_keyword_density (recency decayed) ────────
+    keywords = [kw.lower() for kw in jd.get('keywords', [])]
+    weighted_hits = 0.0
+    for h in candidate.get('career_history', []):
+        if h.get('is_current', False):
+            age_yrs = 0.0
+        else:
+            start = parse_date(h['start_date']).date()
+            age_yrs = max((today - start).days / 365, 0)
+        decay = np.exp(-DECAY_LAMBDA * age_yrs)
+        desc = h.get('description', '').lower()
+        hits = sum(1 for kw in keywords if kw in desc)
+        weighted_hits += hits * decay
+    # normalize against pool max (passed in from pipeline)
+    prod_keyword_density = weighted_hits / max(keyword_max, 1e-9)
+    prod_keyword_density = min(prod_keyword_density, 1.0)
+
+    # ── yoe_score ─────────────────────────────────────
+    yoe = prof.get('years_of_experience', 0)
+    min_yoe = max(jd.get('min_yoe', 1), 1)
+    yoe_score = min(yoe / min_yoe, 1.0)
+
+    A = (0.35 * title_sim
+       + 0.25 * industry_match
+       + 0.25 * prod_keyword_density
+       + 0.15 * yoe_score)
+
+    return {
+        'A': round(A, 4),
+        'title_sim': round(title_sim, 4),
+        'industry_match': round(industry_match, 4),
+        'prod_keyword_density': round(prod_keyword_density, 4),
+        'yoe_score': round(yoe_score, 4),
+    }
+
+def compute_keyword_max(candidates, jd, tfidf):
+    """Pre-compute the max weighted hits across the pool for normalization."""
+    keywords = [kw.lower() for kw in jd.get('keywords', [])]
+    today = datetime.now(timezone.utc).date()
+    max_hits = 0.0
+    for c in candidates:
+        wh = 0.0
+        for h in c.get('career_history', []):
+            age_yrs = 0.0 if h.get('is_current') else \
+                      max((today - parse_date(h['start_date']).date()).days/365, 0)
+            decay = np.exp(-DECAY_LAMBDA * age_yrs)
+            desc = h.get('description','').lower()
+            wh += sum(1 for kw in keywords if kw in desc) * decay
+        max_hits = max(max_hits, wh)
+    return max_hits
+
+Section 6 — Stage 2B: Skill Trust Score (Component B)
+
+
+6.1  Schema Fields Used
+
+
+6.2  Proficiency Weight Map
+
+
+6.3  Trust Score Formula
+
+6.4  Code Blueprint: score_skills.py
+from rapidfuzz import fuzz
+
+PROF_WEIGHT = {'beginner': 0.40, 'intermediate': 0.70,
+               'advanced': 0.90, 'expert': 1.00}
+
+def fuzzy_match_skill(cand_skill_name: str, jd_skills: list[str]) -> str | None:
+    """Returns the matching JD skill name if fuzzy score >= 85, else None."""
+    best_score, best_match = 0, None
+    for jd_skill in jd_skills:
+        score = fuzz.token_sort_ratio(cand_skill_name.lower(), jd_skill.lower())
+        if score > best_score:
+            best_score, best_match = score, jd_skill
+    return best_match if best_score >= 85 else None
+
+def skill_trust(skill_obj: dict, assess_scores: dict, jd_skill: str) -> float:
+    """Compute trust score for a single matched skill."""
+    prof_w    = PROF_WEIGHT.get(skill_obj.get('proficiency','beginner'), 0.40)
+    endorse_w = min(skill_obj.get('endorsements', 0) / 20.0, 1.0)
+    assess_key = next((k for k in assess_scores if jd_skill.lower() in k.lower()), None)
+    assess_w  = (assess_scores[assess_key] / 100.0) if assess_key else 0.0
+    duration_w= min(skill_obj.get('duration_months', 0) / 24.0, 1.0)
+    return prof_w * (0.35 + 0.25*endorse_w + 0.25*assess_w + 0.15*duration_w)
+
+def compute_B(candidate: dict, jd: dict) -> dict:
+    sig = candidate['redrob_signals']
+    assess_scores = sig.get('skill_assessment_scores', {})
+    cand_skills = {s['name']: s for s in candidate.get('skills', [])}
+    must_have = jd.get('must_have_skills', [])
+    nice_have = jd.get('nice_to_have_skills', [])
+
+    def coverage(jd_skills: list) -> float:
+        if not jd_skills: return 0.0
+        total = 0.0
+        for jd_skill in jd_skills:
+            matched_name = fuzzy_match_skill(jd_skill, list(cand_skills.keys()))
+            if matched_name:
+                total += skill_trust(cand_skills[matched_name], assess_scores, jd_skill)
+        return total / len(jd_skills)
+
+    must_cov = coverage(must_have)
+    nice_cov = coverage(nice_have)
+
+    # Certification bonus
+    all_jd_skills = must_have + nice_have
+    cert_bonus = 0.0
+    for cert in candidate.get('certifications', []):
+        if fuzzy_match_skill(cert['name'], all_jd_skills) is not None:
+            cert_bonus = min(cert_bonus + 0.05, 0.15)
+
+    B = min(0.75 * must_cov + 0.25 * nice_cov + cert_bonus, 1.0)
+    return {
+        'B': round(B, 4),
+        'must_have_coverage': round(must_cov, 4),
+        'nice_coverage': round(nice_cov, 4),
+        'cert_bonus': round(cert_bonus, 4),
+    }
+
+Section 7 — Stage 2C: Embedding Similarity (Component C)
+
+
+7.1  Schema Fields Used
+Component C uses only the precomputed artifacts from Stage 0 — no direct schema field access needed at runtime.
+
+
+7.2  Formula
+
+7.3  Code Blueprint: score_embed.py
+import numpy as np, json, faiss
+from pathlib import Path
+
+def load_artifacts(precomputed_dir='data/precomputed'):
+    d = Path(precomputed_dir)
+    jd_vec    = np.load(d / 'jd_vec.npy')         # shape: [1, 384]
+    cand_vecs = np.load(d / 'cand_vecs.npy')      # shape: [N, 384]
+    cand_ids  = json.loads((d / 'cand_ids.json').read_text())
+    return jd_vec, cand_vecs, cand_ids
+
+def compute_C_all(jd_vec, cand_vecs) -> np.ndarray:
+    """Returns similarity scores for all candidates. Shape: [N,]."""
+    # Both are already L2-normalized → dot = cosine
+    scores = (cand_vecs @ jd_vec.T).squeeze()  # [N,]
+    scores = np.clip(scores, 0.0, 1.0)         # guard against float errors
+    return scores
+
+def get_C_map(jd_vec, cand_vecs, cand_ids) -> dict:
+    """Returns {candidate_id: C_score} dict."""
+    scores = compute_C_all(jd_vec, cand_vecs)
+    return {cid: float(scores[i]) for i, cid in enumerate(cand_ids)}
+
+Section 8 — Raw Score Assembly
+
+
+8.1  The Formula
+
+8.2  Code Blueprint: raw_score.py
+from src.score_career import compute_A, compute_keyword_max
+from src.score_skills import compute_B
+from src.score_embed import load_artifacts, get_C_map
+import pickle
+
+def compute_raw_scores(survivors: list, jd: dict) -> list:
+    """
+    Returns list of dicts with candidate_id, A, B, C, raw_score,
+    plus component sub-scores for reasoning generation.
+    """
+    # Load precomputed artifacts once
+    with open('data/precomputed/tfidf.pkl', 'rb') as f:
+        tfidf = pickle.load(f)
+    jd_vec, cand_vecs, cand_ids = load_artifacts()
+    C_map = get_C_map(jd_vec, cand_vecs, cand_ids)
+
+    # Pre-compute keyword max for normalization
+    keyword_max = compute_keyword_max(survivors, jd, tfidf)
+
+    results = []
+    for c in survivors:
+        cid = c['candidate_id']
+        a_result = compute_A(c, jd, tfidf, keyword_max)
+        b_result = compute_B(c, jd)
+        C = C_map.get(cid, 0.0)
+
+        A = a_result['A']
+        B = b_result['B']
+        raw = round(0.40*A + 0.35*B + 0.25*C, 4)
+
+        results.append({
+            'candidate_id': cid,
+            'candidate': c,
+            'A': A, 'B': B, 'C': round(C, 4),
+            'raw_score': raw,
+            **{k: v for k, v in a_result.items() if k != 'A'},
+            **{k: v for k, v in b_result.items() if k != 'B'},
+        })
+
+    return results
+
+Section 9 — Stage 3: Behavioral Availability Multiplier
+
+
+9.1  Schema Fields Used
+
+
+9.2  Multiplier Formula
+
+9.3  Code Blueprint: availability.py
+from datetime import datetime, timezone
+from dateutil.parser import parse as parse_date
+
+def compute_multipliers(candidate: dict, jd: dict, today=None) -> dict:
+    if today is None:
+        today = datetime.now(timezone.utc).date()
+    sig  = candidate['redrob_signals']
+    prof = candidate['profile']
+
+    # ── Availability multiplier ─────────────────────────
+    a_mult = 1.0
+    last_active = parse_date(sig['last_active_date']).date()
+    days_since  = (today - last_active).days
+
+    if sig.get('open_to_work_flag', False):           a_mult += 0.10
+    if days_since <= 14:                              a_mult += 0.10
+    if days_since <= 7:                               a_mult += 0.05  # stacks
+    if sig.get('recruiter_response_rate', 0) >= 0.70: a_mult += 0.05
+    oar = sig.get('offer_acceptance_rate', -1)
+    if oar != -1 and oar >= 0.80:                     a_mult += 0.05
+    if sig.get('avg_response_time_hours', 0) > 72:    a_mult -= 0.05
+    if sig.get('notice_period_days', 0) > 90:         a_mult -= 0.10
+    if sig.get('interview_completion_rate', 1) < 0.50:a_mult -= 0.15
+    if days_since > 90:                               a_mult -= 0.25
+
+    budget_max = jd.get('budget_max_inr_lpa', None)
+    sal = sig.get('expected_salary_range_inr_lpa', {})
+    sal_min = sal.get('min', 0)
+    if budget_max and sal_min > budget_max:            a_mult -= 0.20
+
+    a_mult = max(0.50, min(a_mult, 1.25))
+
+    # ── Location multiplier ─────────────────────────────
+    preferred = set(l.lower() for l in jd.get('preferred_locations', []))
+    cand_loc  = prof.get('location', '').lower()
+    relocate  = sig.get('willing_to_relocate', False)
+    l_mult = 1.0
+    if preferred and any(p in cand_loc for p in preferred):  l_mult += 0.05
+    elif preferred and not relocate:                          l_mult -= 0.05
+    l_mult = max(0.70, min(l_mult, 1.05))
+
+    return {'availability_mult': round(a_mult, 4),
+            'location_mult': round(l_mult, 4)}
+
+def apply_multipliers(scored_results: list, jd: dict) -> list:
+    for r in scored_results:
+        mults = compute_multipliers(r['candidate'], jd)
+        r.update(mults)
+        r['final_score'] = round(
+            min(r['raw_score'] * mults['availability_mult'] * mults['location_mult'], 1.0),
+            4
+        )
+    return scored_results
+
+Section 10 — Stage 4: Top-100 Sort & Reasoning Generation
+
+
+10.1  Schema Fields Used in Reasoning
+
+
+10.2  Output CSV Schema
+
+
+10.3  Code Blueprint: output.py
+import pandas as pd
+
+def generate_reasoning(r: dict, jd: dict) -> str:
+    c   = r['candidate']
+    sig = c['redrob_signals']
+    prof= c['profile']
+    cov = r.get('must_have_coverage', 0)
+    skills_str = ', '.join(
+        s['name'] for s in c.get('skills', [])[:3]
+    )
+    gh_note = (f"GitHub score: {sig['github_activity_score']}"
+               if sig.get('github_activity_score', -1) != -1 else 'No GitHub linked')
+    return (
+        f"{prof['anonymized_name']} | {prof['years_of_experience']}y exp | "
+        f"{prof['current_title']} @ {prof['current_company']} | "
+        f"Skill match: {cov:.0%} must-haves covered | "
+        f"Top skills: {skills_str} | "
+        f"Open to work: {sig['open_to_work_flag']} | "
+        f"Notice: {sig['notice_period_days']}d | "
+        f"{gh_note} | "
+        f"Score: {r['final_score']:.4f} "
+        f"(A={r['A']:.3f} B={r['B']:.3f} C={r['C']:.3f})"
+    )
+
+def write_submission(results: list, jd: dict, out_path='submission.csv'):
+    # Sort by final_score DESC, tiebreak by profile_completeness, saved_by_recruiters
+    def sort_key(r):
+        sig = r['candidate']['redrob_signals']
+        return (
+            -r['final_score'],
+            -sig.get('profile_completeness_score', 0),
+            -sig.get('saved_by_recruiters_30d', 0),
+        )
+    results.sort(key=sort_key)
+    top100 = results[:100]
+
+    rows = []
+    for rank, r in enumerate(top100, start=1):
+        rows.append({
+            'rank':          rank,
+            'candidate_id':  r['candidate_id'],
+            'final_score':   r['final_score'],
+            'raw_score':     r['raw_score'],
+            'component_scores': f"A={r['A']:.3f}|B={r['B']:.3f}|C={r['C']:.3f}",
+            'availability_mult': r['availability_mult'],
+            'location_mult': r['location_mult'],
+            'reasoning':     generate_reasoning(r, jd),
+        })
+
+    df = pd.DataFrame(rows)
+    df.to_csv(out_path, index=False)
+    print(f'Submission written: {out_path} ({len(rows)} candidates)')
+    return df
+
+Section 11 — Full Pipeline Runner
+
+
+11.1  Execution Timeline (100K candidates)
+
+
+11.2  Code Blueprint: pipeline.py
+import json, pickle
+from pathlib import Path
+from src.hard_filter   import apply_hard_filter, load_tfidf
+from src.raw_score     import compute_raw_scores
+from src.availability  import apply_multipliers
+from src.output        import write_submission
+import time
+
+def run_pipeline(
+    candidates_path = 'data/candidates.json',
+    jd_path         = 'data/job_description.json',
+    output_path     = 'submission.csv'
+):
+    t0 = time.time()
+
+    # 1. Load data
+    print('[1/5] Loading data...')
+    candidates = json.loads(Path(candidates_path).read_text())
+    jd         = json.loads(Path(jd_path).read_text())
+    tfidf      = load_tfidf()
+    print(f'    {len(candidates)} candidates loaded.')
+
+    # 2. Stage 1: Hard filter
+    print('[2/5] Applying hard filter...')
+    survivors, killed = apply_hard_filter(candidates, jd, tfidf)
+
+    # 3. Stage 2: Raw scores (A + B + C)
+    print('[3/5] Computing raw scores (A, B, C)...')
+    scored = compute_raw_scores(survivors, jd)
+
+    # 4. Stage 3: Availability multipliers
+    print('[4/5] Applying behavioral multipliers...')
+    scored = apply_multipliers(scored, jd)
+
+    # 5. Stage 4: Sort, top-100, write CSV
+    print('[5/5] Writing submission...')
+    df = write_submission(scored, jd, out_path=output_path)
+
+    elapsed = time.time() - t0
+    print(f'Pipeline complete in {elapsed:.1f}s')
+    print(df[['rank','candidate_id','final_score']].head(10).to_string())
+    return df
+
+if __name__ == '__main__':
+    run_pipeline()
+
+Section 12 — Validation, Testing & Submission
+
+12.1  Unit Test Checklist
+Write one test per scoring component before integrating into the pipeline. These catch off-by-one errors in formula math, incorrect field access, and edge cases (empty skills, null dates).
+
+# tests/test_hard_filter.py
+def test_kills_inactive():
+    cand = make_candidate(last_active='2020-01-01')  # 4+ years ago
+    killed, _ = is_killed(cand, JD, tfidf)
+    assert killed == True
+
+def test_kills_honeypot():
+    cand = make_candidate(github_score=-1, assessments={},
+                         endorsements=0, connections=2)
+    killed, reason = is_killed(cand, JD, tfidf)
+    assert killed and 'honeypot' in reason
+
+# tests/test_score_skills.py
+def test_B_max_is_1():
+    # All expert skills, 20 endorsements, 100 assessment, 24m duration
+    assert compute_B(perfect_cand, JD)['B'] <= 1.0
+
+def test_B_missing_skills_is_zero():
+    cand = make_candidate(skills=[])  # no skills at all
+    assert compute_B(cand, JD)['B'] == 0.0
+
+12.2  Score Distribution Sanity Check
+After running the full pipeline, verify the score distribution looks healthy. Red flags:
+All candidates cluster at > 0.90 — weights are too lenient or normalization is broken.
+All candidates score < 0.10 — TF-IDF not fitted on correct corpus, or JD keyword list is empty.
+Stage 1 kills > 80% — review kill rules, may be too aggressive.
+Top-100 final scores are all identical — multiplier or sort logic is broken.
+
+# Quick sanity after pipeline run
+import pandas as pd
+df = pd.read_csv('submission.csv')
+print(df['final_score'].describe())
+print('Top 5:')
+print(df[['rank','candidate_id','final_score','reasoning']].head())
+
+12.3  Submission CSV Validation
+Exactly 100 rows (or fewer if < 100 candidates survived).
+candidate_id matches pattern CAND_XXXXXXX (7 digits).
+rank column is 1..100 with no gaps.
+final_score values are in [0, 1] with 4 decimal places.
+reasoning column has no commas unescaped (use pandas default quote handling).
+
+assert len(df) <= 100
+assert df['rank'].tolist() == list(range(1, len(df)+1))
+assert df['candidate_id'].str.match(r'^CAND_[0-9]{7}$').all()
+assert (df['final_score'] >= 0).all() and (df['final_score'] <= 1).all()
+print('All validation checks passed.')
+
+Section 13 — Advanced Upgrades (Optional)
+
+
+13.1  Reciprocal Rank Fusion (RRF)
+Run BM25 retrieval separately using rank_bm25 library. Fuse BM25 rank + embedding rank using RRF formula. Consistently outperforms either alone.
+pip install rank-bm25
+
+# RRF formula
+def rrf_score(rank_bm25: int, rank_embed: int, k=60) -> float:
+    return 1/(k + rank_bm25) + 1/(k + rank_embed)
+
+13.2  LambdaMART Learning-to-Rank
+If the challenge provides ground-truth labels (hired/not hired), train a pairwise LTR model using XGBoost Ranker on features [A, B, C, availability signals].
+pip install xgboost lightgbm
+# Features: [A, B, C, availability_mult, github_activity_score,
+#            search_appearance_30d, saved_by_recruiters_30d]
+# Label: 1 = selected, 0 = rejected
+
+13.3  Salary Overlap Signal
+If the JD specifies a salary budget, compute the range overlap as a continuous signal rather than a binary penalty.
+
+13.4  Education Tier Signal
+Use the education[].tier field (tier_1 through tier_4) as a small bonus for roles where institution prestige matters (finance, consulting, research).
+TIER_BONUS = {'tier_1': 0.08, 'tier_2': 0.04, 'tier_3': 0.01,
+              'tier_4': 0.0, 'unknown': 0.0}
+
+best_tier = min(  # tier_1 is best
+    (e.get('tier','unknown') for e in candidate.get('education',[])),
+    key=lambda t: int(t.split('_')[1]) if '_' in t else 5,
+    default='unknown'
+)
+edu_bonus = TIER_BONUS[best_tier]
+# Add edu_bonus to A score (career component)
+
+
+
+End of Implementation Guide
+Redrob Challenge — Winning Ranker Architecture
+S0 | Offline Precompute  —  Build once, reuse forever | [ONCE]
+~10 min | ONCE
+S1 | Hard Disqualify Filter  —  Kills invalid/ghost candidates | [KILL]
+Fastest | KILL
+S2 | Three-Component Raw Score  —  A×0.40 + B×0.35 + C×0.25 | [SCORE]
+Main scoring | SCORE
+S3 | Behavioral Availability Multiplier  —  Rewards active candidates | [MULT]
+final = raw × mult | MULT
+S4 | Top-100 Sort + Reasoning  —  Output submission CSV | [OUT]
+Deliverable | OUT
+Purpose
+Run ONCE before any ranking. Embeds the JD and all candidates into dense vectors. Builds a FAISS index for sub-millisecond cosine lookup at ranking time. Also fits a TF-IDF vectorizer on all candidate text. Saves everything to disk. Runtime: ~10–15 min for 100K candidates on CPU.
+Schema Field | Source Object | Usage | Notes
+skills[].name | skills array | Candidate text corpus | All skill names joined
+current_title | profile | Candidate text corpus | Prepended to text
+career[].title | career_history | Candidate text corpus | All past titles
+career[].description | career_history | Candidate text corpus | Capped at 500 chars each
+career[].duration_months | career_history | Recency weighting | Longer = more weight
+candidate_id | root | Index ordering | Saved to cand_ids.json
+cand_text[i] =
+    profile.current_title
+  + ' ' + profile.headline
+  + ' ' + ' '.join(skills[j].name for j in range(len(skills)))
+  + ' ' + ' '.join(
+        career[k].title + ' ' + career[k].description[:500]
+        for k in range(len(career_history))
+    )
+💡 Keep each career description capped at 500 chars to avoid token overflow. Concatenation order: title first (highest signal), then skills, then career narrative.
+Runtime Note
+On CPU with 100K candidates: ~8–12 min for MiniLM embedding. BGE-small is slightly more accurate but similar speed. Both produce 384-dim vectors. FAISS flat index with 100K × 384 vectors uses ~150 MB RAM at query time — well within 16 GB budget.
+Purpose
+Before any scoring runs, eliminate candidates that are structurally invalid, clearly mismatched, or ghost profiles. Sets final_score = 0 for killed candidates. Survivors proceed to Stage 2. This is the cheapest operation and yields the most runtime savings.
+Schema Field | Source Object | Usage | Notes
+profile_completeness_score | redrob_signals | Ghost filter | Kill if < 30
+verified_email | redrob_signals | Identity validation | Kill if False
+interview_completion_rate | redrob_signals | Serial no-show filter | Kill if < 0.20
+last_active_date | redrob_signals | Staleness filter | Kill if > 180 days ago
+open_to_work_flag | redrob_signals | Availability check | Kill if False
+current_industry | profile | Industry mismatch | Cross-ref JD industries
+career[].industry | career_history | Industry coverage | At least one must match
+current_title | profile | Title relevance | TF-IDF cosine vs JD title
+github_activity_score | redrob_signals | Honeypot detection | Combined ghost signal
+endorsements_received | redrob_signals | Honeypot detection | Combined with above
+connection_count | redrob_signals | Honeypot detection | < 5 = suspicious
+skill_assessment_scores | redrob_signals | Honeypot detection | Empty = suspicious
+KILL (score=0) if ANY of the following is true:
+
+# Rule 1: Incomplete / ghost profile
+profile_completeness_score < 30
+
+# Rule 2: Unverified identity
+verified_email == False
+
+# Rule 3: Serial interview no-show
+interview_completion_rate < 0.20
+
+# Rule 4: Stale / inactive profile
+(today - last_active_date).days > 180
+
+# Rule 5: Not looking for work
+open_to_work_flag == False
+
+# Rule 6: Zero industry overlap
+len({current_industry} ∪ {career[].industry} ∩ JD.target_industries) == 0
+
+# Rule 7: Title completely off-topic
+cosine(tfidf(current_title), tfidf(JD.title)) < 0.05
+
+# Rule 8: Honeypot / synthetic profile
+github_activity_score == -1
+  AND len(skill_assessment_scores) == 0
+  AND endorsements_received == 0
+  AND connection_count < 5
+💡 Rules are applied in order. As soon as one fires, the candidate is killed — remaining rules are skipped for that candidate. This short-circuit saves time.
+Purpose
+Scores role fit using structured career signals: how similar the candidate's current title is to the JD role, industry overlap across career, presence of JD keywords in career descriptions, and experience level match. Weight in final formula: 40%.
+Schema Field | Source Object | Usage | Notes
+current_title | profile | TF-IDF title similarity | vs JD title
+current_industry | profile | Industry match | Part of industry set
+career[].industry | career_history | Industry coverage | All past industries
+career[].description | career_history | Keyword density | JD keywords scanned here
+career[].duration_months | career_history | Recency decay weight | exp(-0.15 × age_yrs)
+career[].start_date | career_history | Recency calculation | Compute age in years
+career[].is_current | career_history | Recency shortcut | Current role gets 0 decay
+years_of_experience | profile | YOE score | min(yoe / JD.min_yoe, 1)
+current_company_size | profile | Optional prestige signal | Tier bonus (optional)
+A = 0.35 × title_sim
+  + 0.25 × industry_match
+  + 0.25 × prod_keyword_density
+  + 0.15 × yoe_score
+
+─────────────────────────────────────────────────
+
+title_sim = cosine(tfidf(current_title), tfidf(JD.title))  ∈ [0, 1]
+
+industry_match:
+  cand_industries = {current_industry} ∪ {career[k].industry}
+  matched = len(cand_industries ∩ JD.target_industries)
+  industry_match = min(matched / max(len(JD.target_industries), 1), 1.0)
+
+prod_keyword_density (with recency decay):
+  For each career role k:
+    age_k = (today - career[k].start_date).days / 365
+    if career[k].is_current: age_k = 0
+    decay_k = exp(-0.15 × age_k)
+    hits_k = count(JD.keywords found in career[k].description.lower())
+    weighted_hits += hits_k × decay_k
+  prod_keyword_density = weighted_hits / max(weighted_hits_pool)
+  (normalize by max across entire candidate pool for this JD)
+
+yoe_score = min(years_of_experience / max(JD.min_yoe, 1), 1.0)
+  (capped at 1.0 — no bonus for over-qualification)
+💡 Recency decay (lambda=0.15) means a 5-year-old role counts at 47% of a current role. A 10-year-old role counts at 22%.
+Purpose
+The highest signal-to-complexity ratio component. Scores how well a candidate's skills match JD requirements, weighted by the trustworthiness of each skill claim. Trust is built from three independent evidence sources: peer endorsements, platform assessment scores, and usage duration.
+Schema Field | Source Object | Usage | Notes
+skills[].name | skills | JD skill lookup | Fuzzy match to JD skills
+skills[].proficiency | skills | prof_weight | beginner→expert map
+skills[].endorsements | skills | Social proof signal | Capped at 20
+skills[].duration_months | skills | Depth / recency | Capped at 24 months
+skill_assessment_scores | redrob_signals | Objective test score | 0–100 per skill
+certifications[].name | certifications | Bonus signal | +0.05 per cert match
+certifications[].issuer | certifications | Cert quality | Optional tier weight
+Proficiency Level | prof_weight
+beginner | 0.40
+intermediate | 0.70
+advanced | 0.90
+expert | 1.00
+For each required skill s in JD.must_have_skills:
+
+  If skill s is present in candidate.skills[]:
+    prof_weight  = { beginner:0.40, intermediate:0.70,
+                     advanced:0.90, expert:1.00 }[proficiency]
+
+    endorse_w    = min(endorsements / 20.0, 1.0)    # cap at 20 endorsements
+    assess_w     = skill_assessment_scores.get(s, 0) / 100.0
+    duration_w   = min(duration_months / 24.0, 1.0) # cap at 24 months
+
+    trust_s = prof_weight × (0.35 + 0.25×endorse_w
+                                  + 0.25×assess_w
+                                  + 0.15×duration_w)
+  Else:
+    trust_s = 0.0
+
+must_have_cov = Σ(trust_s) / len(JD.must_have_skills)   ∈ [0, 1]
+
+# Repeat same formula for nice-to-have skills:
+nice_cov = Σ(trust_s) / len(JD.nice_to_have_skills)     ∈ [0, 1]
+
+# Certification bonus
+cert_bonus = 0.0
+for cert in certifications[]:
+  if fuzzy_match(cert.name, any JD skill) >= 85:
+    cert_bonus += 0.05
+cert_bonus = min(cert_bonus, 0.15)   # hard cap
+
+B = min(0.75 × must_have_cov + 0.25 × nice_cov + cert_bonus, 1.0)
+💡 trust_s is not the raw proficiency — it's proficiency × evidence strength. An 'expert' with zero endorsements and no assessment scores gets trust_s = 1.0 × (0.35 + 0 + 0 + 0) = 0.35. An 'intermediate' with 20 endorsements + 90 assessment + 24m duration gets 0.70 × 1.0 = 0.70.
+Purpose
+Performs a semantic holistic match between the JD and each candidate using precomputed dense vectors from Stage 0. Catches synonyms, paraphrases, and narrative coherence that TF-IDF keyword matching misses. O(1) lookup per candidate via FAISS. Weight in final formula: 25%.
+Schema Field | Source Object | Usage | Notes
+jd_vec.npy | Stage 0 artifact | JD embedding | 384-dim float32 vector
+cand_vecs.npy | Stage 0 artifact | Candidate embeddings | Shape: [N, 384]
+faiss.index | Stage 0 artifact | Similarity index | FAISS IndexFlatIP
+cand_ids.json | Stage 0 artifact | ID ordering map | Maps index pos → candidate_id
+C[i] = dot(jd_vec, cand_vecs[i])   ∈ [0, 1]
+
+# Because both vectors are L2-normalized (done in Stage 0),
+# dot product = cosine similarity. Computed for all N candidates
+# in one vectorized operation:
+
+C_all = cand_vecs @ jd_vec.T   # shape: [N,] — entire pool in one call
+💡 With normalized vectors and FAISS IndexFlatIP, this is a single matrix multiplication: ~50ms for 100K candidates on CPU. No per-candidate loop needed.
+Purpose
+Combine the three component scores into a single raw_score. This module is the central hub — it calls Stage 2A, 2B, 2C for each surviving candidate and assembles the weighted sum.
+raw_score = 0.40 × A  +  0.35 × B  +  0.25 × C
+
+Where:
+  A  ∈ [0, 1]  =  Title + Career Match (Section 5)
+  B  ∈ [0, 1]  =  Skill Trust Score    (Section 6)
+  C  ∈ [0, 1]  =  Embedding Similarity (Section 7)
+
+raw_score ∈ [0, 1]
+💡 Weight rationale: A (40%) dominates because role and career fit is the primary hiring criterion. B (35%) is second — skill coverage is the most actionable signal. C (25%) provides semantic lift but is less interpretable to a recruiter.
+Purpose
+Multiplies the raw_score by two independent multipliers: one for behavioral availability signals (how likely the candidate is to actually respond and show up), and one for location fit. This rewards active, responsive candidates and penalizes ghost/stale ones who survived the hard filter.
+Schema Field | Source Object | Usage | Notes
+open_to_work_flag | redrob_signals | Availability | +0.10
+last_active_date | redrob_signals | Recency | +0.10 if < 14d
+recruiter_response_rate | redrob_signals | Responsiveness | +0.05 if >= 0.70
+avg_response_time_hours | redrob_signals | Response speed | -0.05 if > 72h
+notice_period_days | redrob_signals | Time to join | -0.10 if > 90d
+interview_completion_rate | redrob_signals | Reliability | -0.15 if < 0.50
+expected_salary_range_inr_lpa | redrob_signals | Salary fit | Soft penalty
+preferred_work_mode | redrob_signals | Work mode match | Optional filter
+willing_to_relocate | redrob_signals | Location flexibility | location_mult
+location | profile | Geo match | vs JD preferred_locations
+offer_acceptance_rate | redrob_signals | Intent signal | +0.05 if >= 0.80
+profile_views_received_30d | redrob_signals | Market interest | Tiebreaker only
+availability_mult = 1.0   # baseline
+  + 0.10  if open_to_work_flag == True
+  + 0.10  if (today - last_active_date).days <= 14
+  + 0.05  if (today - last_active_date).days <= 7    # very fresh (stacks)
+  + 0.05  if recruiter_response_rate >= 0.70
+  + 0.05  if offer_acceptance_rate >= 0.80 (and != -1)
+  - 0.05  if avg_response_time_hours > 72
+  - 0.10  if notice_period_days > 90
+  - 0.15  if interview_completion_rate < 0.50
+  - 0.25  if (today - last_active_date).days > 90
+  - 0.20  if expected_salary_min > JD.budget_max (salary mismatch)
+→ clamp to [0.50, 1.25]
+
+location_mult = 1.0   # baseline
+  + 0.05  if candidate.location ∈ JD.preferred_locations
+  - 0.05  if not (location ∈ JD.locations OR willing_to_relocate)
+→ clamp to [0.70, 1.05]
+
+final_score = raw_score × availability_mult × location_mult
+final_score = min(final_score, 1.0)   # clip ceiling
+💡 The multiplier does not change rank order for candidates with similar raw scores, but it significantly penalizes candidates who are hard to hire even if they look good on paper. A perfect raw_score=1.0 candidate with notice_period=120d and last_active=100d ago gets final_score ≈ 0.50.
+Purpose
+Sort all survivors by final_score descending. Take top 100. For each, generate a human-readable reasoning string from structured fields. Write the submission.csv with all required columns.
+Schema Field | Source Object | Usage | Notes
+anonymized_name | profile | Reasoning header | Display in output
+current_title | profile | Reasoning header | Current role label
+current_company | profile | Reasoning header | Company context
+years_of_experience | profile | Reasoning body | YOE label
+open_to_work_flag | redrob_signals | Reasoning footer | Availability note
+notice_period_days | redrob_signals | Reasoning footer | Join timeline
+github_activity_score | redrob_signals | Reasoning footer | Technical signal
+profile_completeness_score | redrob_signals | Tiebreaker sort | Secondary sort key
+saved_by_recruiters_30d | redrob_signals | Tiebreaker sort | Market validation
+rank | candidate_id | final_score | raw_score | component_a_b_c | reasoning
+1–100 | CAND_XXXXXXX | 0.0–1.0 | 0.0–1.0 | A|B|C format | Template string
+Purpose
+Single entry point that wires all stages together. Run this after Stage 0 (precompute) is complete. Target: < 5 minutes for 100K candidates on CPU with 16GB RAM.
+Stage | Target Time | Operation | Output
+Load + Stage 0 load | ~5 sec | Read JSON + load pkl/npy | In memory
+Stage 1 Filter | ~8 sec | Kill rules per candidate | ~60K survivors
+Compute C (all) | ~0.5 sec | FAISS matmul on survivors | C_map dict
+Keyword max scan | ~3 sec | Pool-wide normalization | keyword_max float
+Stage 2A per survivor | ~25 sec | TF-IDF + career scoring | A per candidate
+Stage 2B per survivor | ~15 sec | Skill trust scoring | B per candidate
+Stage 3 multipliers | ~5 sec | Availability + location | final_score
+Stage 4 sort + CSV | ~2 sec | Sort + reasoning + write | submission.csv
+TOTAL | ~64 sec | Well within 5-min budget | ✓
+These are NOT needed for a working submission. Implement in order only after the baseline is running and validated.
+FFF8E7
+overlap = max(0, min(cand.salary_max, jd.budget_max)
+              - max(cand.salary_min, jd.budget_min))
+range_width = jd.budget_max - jd.budget_min
+salary_fit = overlap / range_width if range_width > 0 else 0.0
+💡 Add salary_fit as a small bonus (+0.05 max) or blend into the availability multiplier.
