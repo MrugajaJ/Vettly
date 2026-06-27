@@ -8,7 +8,7 @@ from pathlib import Path
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-from src.hard_filter import apply_hard_filter
+from src.hard_filter import apply_hard_filter, is_killed
 from src.score_career import compute_A, compute_keyword_max
 from src.score_skills import compute_B
 from src.score_embed import compute_C_all
@@ -25,7 +25,7 @@ def run_fast_pipeline():
     
     # Paths
     jd_path = Path("data/job_description.json")
-    candidates_path = Path("[PUB] India_runs_data_and_ai_challenge/India_runs_data_and_ai_challenge/candidates.jsonl")
+    candidates_path = Path("data/candidates.jsonl")
     output_path = Path("submission.csv")
     
     if not jd_path.exists():
@@ -33,32 +33,49 @@ def run_fast_pipeline():
     if not candidates_path.exists():
         raise FileNotFoundError(f"Candidates dataset not found at {candidates_path}")
         
-    # 1. Load Job Description and candidates
+    # 1. Load Job Description
     print("Loading Job Description...")
     with open(jd_path, "r", encoding="utf-8") as f:
         jd = json.load(f)
         
-    print("Loading 100,000 candidates (streamed from JSONL)...")
-    candidates = []
+    # ── PASS 1: Stream titles only to fit TF-IDF (low memory) ──
+    print("Pass 1: Streaming 100,000 candidate titles for TF-IDF fit...")
     titles = []
     with open(candidates_path, "r", encoding="utf-8") as f:
         for line in f:
+            line = line.strip()
+            if not line:
+                continue
             cand = json.loads(line)
-            candidates.append(cand)
             title = cand.get("profile", {}).get("current_title") or cand.get("current_title") or ""
             titles.append(title)
             
-    print(f"Loaded {len(candidates)} candidates.")
+    total_count = len(titles)
+    print(f"  Collected {total_count} titles.")
     
     # 2. Fit TF-IDF on all candidate titles for the hard filter
     print("Fitting TF-IDF Vectorizer on all candidate titles...")
     tfidf = TfidfVectorizer(max_features=30000, ngram_range=(1, 2))
     tfidf.fit(titles)
+    del titles  # free memory immediately
     
-    # 3. Apply Hard Filters (Stage 1)
-    print("\n--- STAGE 1: Applying Hard Filters ---")
-    survivors, killed = apply_hard_filter(candidates, jd, tfidf)
-    print(f"Killed: {len(killed)} candidates.")
+    # ── PASS 2: Stream again — hard-filter inline and collect survivors ──
+    print("\n--- STAGE 1: Applying Hard Filters (streaming pass 2) ---")
+    survivors = []
+    killed_count = 0
+    with open(candidates_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            cand = json.loads(line)
+            killed_flag, reason = is_killed(cand, jd, tfidf)
+            if killed_flag:
+                killed_count += 1
+            else:
+                survivors.append(cand)
+                
+    print(f"Killed:    {killed_count} candidates.")
     print(f"Surviving: {len(survivors)} candidates.")
     
     if not survivors:
