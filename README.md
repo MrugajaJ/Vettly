@@ -27,21 +27,21 @@
 
 ---
 
-## 📌 The Problem
+## The Problem
 
 > *"Recruiters are tasked with finding the perfect fit from oceans of profiles, but traditional keyword filters are simply not cutting it. They miss the hidden gems — candidates whose true potential, intent, and subtle behavioral signals are lost in the noise."*
 
 Traditional ATS and keyword matching tools are fundamentally broken:
 
-- ❌ **Keyword stuffing** lets unqualified candidates rank above genuine experts
-- ❌ **Static resume scanning** ignores real-time candidate intent and availability
-- ❌ **Binary skill checklists** treat self-declared expertise as ground truth
-- ❌ **No fraud detection** leaves pipelines polluted with ghost and synthetic profiles
-- ❌ **No behavioral signals** result in shortlists full of candidates who never respond
+- **Keyword stuffing** lets unqualified candidates rank above genuine experts
+- **Static resume scanning** ignores real-time candidate intent and availability
+- **Binary skill checklists** treat self-declared expertise as ground truth
+- **No fraud detection** leaves pipelines polluted with ghost and synthetic profiles
+- **No behavioral signals** result in shortlists full of candidates who never respond
 
 ---
 
-## 💡 The Solution: Vettly
+## The Solution: Vettly
 
 **Vettly** is a **predictive candidate discovery and ranking engine** that combines semantic embeddings, verified skill trust scores, and real-time behavioral intent signals to rank candidates far beyond what keywords alone can achieve.
 
@@ -49,16 +49,16 @@ Traditional ATS and keyword matching tools are fundamentally broken:
 
 | Capability | Description |
 |---|---|
-| 🧠 **Semantic Understanding** | Dense vector embeddings capture context, synonyms & narrative coherence |
-| 🔬 **Verified Skill Trust** | Evidence-based competency scores using endorsements, tests & duration |
-| 📡 **Behavioral Recruitability** | Real-time signals like activity recency, response rates & salary fit |
-| 🛡️ **Fraud Defense** | Honeypot detection eliminates synthetic and spam profiles |
-| ⚡ **Scale Performance** | 100,000 candidates ranked in ~64 seconds on a single CPU |
-| 📋 **Explainable Output** | Deterministic, human-readable reasoning for every shortlisted candidate |
+| **Semantic Understanding** | Dense vector embeddings capture context, synonyms & narrative coherence |
+| **Verified Skill Trust** | Evidence-based competency scores using endorsements, tests & duration |
+| **Behavioral Recruitability** | Real-time signals like activity recency, response rates & salary fit |
+| **Fraud Defense** | Honeypot detection eliminates synthetic and spam profiles |
+| **Scale Performance** | 100,000 candidates ranked in ~64 seconds on a single CPU |
+| **Explainable Output** | Deterministic, human-readable reasoning for every shortlisted candidate |
 
 ---
 
-## 🏗️ System Architecture
+## System Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -130,95 +130,8 @@ Traditional ATS and keyword matching tools are fundamentally broken:
 
 ---
 
-## 📐 Scoring Formulas
 
-### Raw Score
-```
-Raw Score = 0.40 × A  +  0.35 × B  +  0.25 × C
-```
-
-### Component A — Career & Role Fit
-```
-A = 0.35 × title_sim
-  + 0.25 × industry_match       (Jaccard overlap)
-  + 0.25 × keyword_density      (exp(-0.15 × age_years) decay)
-  + 0.15 × yoe_score            (min(YoE / JD.min_yoe, 1.0))
-```
-
-### Component B — Skill Trust Score
-```
-For each matched skill:
-  trust = proficiency_weight × (0.35 + 0.25×endorse_w + 0.25×assess_w + 0.15×duration_w)
-
-Proficiency weights: Beginner=0.40 | Intermediate=0.70 | Advanced=0.90 | Expert=1.00
-
-B = min(0.75 × must_have_coverage + 0.25 × nice_coverage + cert_bonus, 1.0)
-cert_bonus: +0.05 per matched cert, max 0.15
-```
-
-### Component C — Semantic Similarity
-```
-C = dot(L2_norm(jd_vec), L2_norm(cand_vec))   ∈ [0, 1]
-  = cosine similarity via FAISS IndexFlatIP
-```
-
-### Final Score
-```
-Final Score = min(Raw Score × availability_mult × location_mult, 1.0)
-```
-
-### Availability Multiplier
-```
-Base: 1.0
-  + 0.10  open_to_work == True
-  + 0.10  active ≤ 14 days
-  + 0.05  active ≤ 7 days (stacks)
-  + 0.05  recruiter_response_rate ≥ 0.70
-  + 0.05  offer_acceptance_rate ≥ 0.80
-  - 0.05  avg_response_time > 72 hrs
-  - 0.10  notice_period > 90 days
-  - 0.15  interview_completion_rate < 0.50
-  - 0.25  inactive > 90 days
-  - 0.20  salary_min > JD budget_max
-Clamp: [0.50, 1.25]
-```
-
----
-
-## 📁 Project Structure
-
-```
-Vettly/
-├── data/
-│   ├── candidates.jsonl           # 100K candidate profiles (input)
-│   ├── job_description.json       # Structured JD (input)
-│   └── precomputed/
-│       ├── jd_vec.npy             # JD dense vector
-│       ├── cand_vecs.npy          # Candidate dense vectors
-│       ├── cand_ids.json          # ID → index mapping
-│       ├── faiss.index            # FAISS flat index
-│       └── tfidf.pkl              # Fitted TF-IDF vectorizer
-├── src/
-│   ├── precompute.py              # Stage 0: Offline embedding & indexing
-│   ├── hard_filter.py             # Stage 1: 8-rule disqualification engine
-│   ├── score_career.py            # Stage 2A: Title, industry, keyword, YoE
-│   ├── score_skills.py            # Stage 2B: Fuzzy skill trust scoring
-│   ├── score_embed.py             # Stage 2C: FAISS cosine similarity
-│   ├── raw_score.py               # Weighted A+B+C combination
-│   ├── availability.py            # Stage 3: Behavioral multipliers
-│   ├── output.py                  # Stage 4: Sort, reason, export CSV
-│   ├── pipeline.py                # Standard pipeline runner
-│   └── run_fast_pipeline.py       # High-performance streaming runner
-├── tests/
-│   └── test_*.py                  # Unit tests per component
-├── submission.csv                 # Final ranked output
-├── requirements.txt
-└── README.md
-```
-
----
-
-## ⚙️ Setup & Installation
+## Setup & Installation
 
 ### Prerequisites
 - Python 3.10 or 3.11 (recommended)
@@ -253,47 +166,8 @@ pytest==8.2.0
 
 ---
 
-## 🚀 Running the Pipeline
 
-### Step 1: Prepare Inputs
-
-Ensure the following files exist:
-```
-data/candidates.jsonl        # One candidate JSON object per line
-data/job_description.json    # Structured JD file
-```
-
-**Example `job_description.json`:**
-```json
-{
-  "title": "Senior AI Engineer",
-  "min_yoe": 5,
-  "target_industries": ["Technology", "AI", "SaaS"],
-  "preferred_locations": ["Bangalore", "Hyderabad", "Remote"],
-  "budget_max_inr_lpa": 40,
-  "must_have_skills": ["Python", "FAISS", "Embeddings", "Sentence Transformers"],
-  "nice_to_have_skills": ["LLM Fine-tuning", "LoRA", "XGBoost"],
-  "keywords": ["embeddings", "retrieval", "ranking", "vector database"],
-  "description": "Full JD text here..."
-}
-```
-
-### Step 2: Run the Fast Pipeline
-
-```bash
-python -m src.run_fast_pipeline
-```
-
-### Step 3: Check Output
-
-```bash
-# View top 10 results
-python -c "import pandas as pd; print(pd.read_csv('submission.csv')[['rank','candidate_id','final_score','reasoning']].head(10).to_string())"
-```
-
----
-
-## 📊 Output Format
+## Output Format
 
 The final `submission.csv` contains 100 rows with the following schema:
 
@@ -318,7 +192,7 @@ Score: 0.5565 (A=0.547 B=0.184 C=0.803)
 
 ---
 
-## ⚡ Performance Metrics
+## Performance Metrics
 
 | Stage | Operation | Time |
 |---|---|---|
@@ -337,7 +211,7 @@ Score: 0.5565 (A=0.547 B=0.184 C=0.803)
 
 ---
 
-## 🛡️ Fraud & Quality Defense
+## Fraud & Quality Defense
 
 Vettly implements a multi-layer defense against low-quality data:
 
@@ -359,7 +233,7 @@ Vettly implements a multi-layer defense against low-quality data:
 
 ---
 
-## 🔬 Technology Stack
+## Technology Stack
 
 | Technology | Role | Why Selected |
 |---|---|---|
@@ -373,7 +247,7 @@ Vettly implements a multi-layer defense against low-quality data:
 
 ---
 
-## 🧪 Running Tests
+## Running Tests
 
 ```bash
 pytest tests/ -v
@@ -388,34 +262,6 @@ Tests cover:
 
 ---
 
-## 📈 Submission Validation
-
-```python
-import pandas as pd
-
-df = pd.read_csv('submission.csv')
-
-assert len(df) <= 100, "Too many rows"
-assert df['rank'].tolist() == list(range(1, len(df)+1)), "Rank gaps detected"
-assert df['candidate_id'].str.match(r'^CAND_[0-9]{7}$').all(), "Invalid ID format"
-assert (df['final_score'] >= 0).all() and (df['final_score'] <= 1).all(), "Score out of range"
-
-print("✅ All validation checks passed.")
-print(df['final_score'].describe())
-```
-
----
-
-## 🔮 Advanced Upgrades (Optional)
-
-| Feature | Description |
-|---|---|
-| **Reciprocal Rank Fusion (RRF)** | Fuse BM25 + embedding ranks: `1/(k+rank_bm25) + 1/(k+rank_embed)` |
-| **LambdaMART LTR** | XGBoost ranker trained on hired/rejected labels using [A, B, C, signals] as features |
-| **Education Tier Bonus** | Add prestige signal: tier_1 = +0.08, tier_2 = +0.04 to Career Score |
-| **Continuous Salary Overlap** | Replace binary penalty with overlap ratio as a soft signal |
-
----
 
 <div align="center">
 
