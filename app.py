@@ -1,7 +1,6 @@
 import streamlit as st
 import json
 import time
-import gzip
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -132,7 +131,7 @@ col_up1, col_up2 = st.columns(2)
 with col_up1:
     uploaded_jd = st.file_uploader("Job Description (JSON)", type=["json"])
 with col_up2:
-    uploaded_candidates = st.file_uploader("Candidates Dataset (JSONL or GZ)", type=["jsonl", "gz", "jsonl.gz"])
+    uploaded_candidates = st.file_uploader("Candidates Dataset (JSONL)", type=["jsonl"])
     use_default_candidates = st.checkbox("Use Demo Candidates Dataset (100,000 Profiles) - Instant Load", value=False)
 
 if use_default_candidates:
@@ -187,15 +186,9 @@ else:
         progress_bar.progress(15)
         
         titles = []
-        is_gz = getattr(uploaded_candidates, "name", "").endswith(".gz")
-        
-        def stream_file(fobj):
-            fobj.seek(0)
-            if is_gz:
-                return gzip.GzipFile(fileobj=fobj, mode='rb')
-            return fobj
-
-        for line_bytes in stream_file(uploaded_candidates):
+        # Reset and read lines from the uploaded file buffer
+        uploaded_candidates.seek(0)
+        for line_bytes in uploaded_candidates:
             line = line_bytes.decode("utf-8").strip()
             if not line:
                 continue
@@ -207,13 +200,16 @@ else:
         tfidf.fit(titles)
         del titles
         
+        # Reset and read lines for Filtering Pass
+        uploaded_candidates.seek(0)
+        
         # 2. Hard Filtering
         status_box.info("Applying hard gatekeeper rules (Profile Completeness, Activity, Intent)...")
         progress_bar.progress(35)
         
         survivors = []
         killed_reasons = {}
-        for line_bytes in stream_file(uploaded_candidates):
+        for line_bytes in uploaded_candidates:
             line = line_bytes.decode("utf-8").strip()
             if not line:
                 continue
